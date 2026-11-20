@@ -28,6 +28,11 @@ TABLES: dict[str, dict[str, str]] = {
     # what goes into one cup of each drink
     "recipes": {"id": "int", "product_id": "int", "product_name": "str", "item": "str", "quantity": "float",
                 "unit": "str"},
+    # the names offered in drop-down lists ("costs": running-cost names, "items": purchase items)
+    "choices": {"id": "int", "list": "str", "name": "str"},
+    # one row per customer order; "lines" is product_id*quantity*price|... so an order can be undone
+    "orders": {"id": "int", "order_date": "date", "order_time": "str", "items": "str", "method": "str",
+               "total": "float", "lines": "str"},
 }
 
 
@@ -96,7 +101,9 @@ class SQLiteStore:
 class SheetsStore:
     """One worksheet (tab) per table inside a single Google Sheet."""
 
-    CACHE_SECONDS = 300  # re-read the sheet after 5 minutes, so hand edits in Google Sheets show up
+    # Reads come from a copy at most this old, so tapping around doesn't hit Google's request limit.
+    # Every change re-reads first (see db._locked), so a stale copy is never written back.
+    CACHE_SECONDS = 15
 
     def __init__(self, spreadsheet, client_email: str = ""):
         self.sh = spreadsheet
@@ -147,26 +154,39 @@ class SheetsStore:
         self._worksheets[table] = ws
         return ws
 
+    @staticmethod
+    def _to_frame(table: str, values: list[list]) -> pd.DataFrame:
+        if not values:
+            return empty(table)
+        header = [str(h).strip() for h in values[0]]
+        rows = [r + [""] * (len(header) - len(r)) for r in values[1:] if any(str(c).strip() for c in r)]
+        return coerce(table, pd.DataFrame([r[:len(header)] for r in rows], columns=header))
+
+    def _load_all(self) -> None:
+        """Fetch every tab in ONE request to Google and remember it."""
+        for table in TABLES:          # make sure each tab exists (only costs requests the first time)
+            self._ws(table)
+        resp = self.sh.values_batch_get([f"'{t}'" for t in TABLES])
+        stamp = time.monotonic()
+        for table, vr in zip(TABLES, resp.get("valueRanges", [])):
+            values = vr.get("values", [])
+            self._cache[table] = (stamp, self._to_frame(table, values), len(values))
+
     def _read(self, table: str) -> pd.DataFrame:
         hit = self._cache.get(table)
-        if hit and time.monotonic() - hit[0] < self.CACHE_SECONDS:
-            return hit[1].copy()
-        values = self._ws(table).get_all_values()
-        if values:
-            header = [h.strip() for h in values[0]]
-            rows = [r + [""] * (len(header) - len(r)) for r in values[1:] if any(str(c).strip() for c in r)]
-            df = coerce(table, pd.DataFrame([r[:len(header)] for r in rows], columns=header))
-        else:
-            df = empty(table)
-        self._cache[table] = (time.monotonic(), df, len(values))
-        return df.copy()
+        if not (hit and time.monotonic() - hit[0] < self.CACHE_SECONDS):
+            self._load_all()
+            hit = self._cache[table]
+        return hit[1].copy()
 
     def _write(self, table: str, df: pd.DataFrame) -> None:
         ws = self._ws(table)
         df = coerce(table, df)
         cols = list(TABLES[table])
         values = [cols] + [[_cell(v) for v in row] for row in df[cols].itertuples(index=False)]
-        old_rows = self._cache[table][2] if table in self._cache else len(ws.get_all_values())
+        if table not in self._cache:
+            self._load_all()
+        old_rows = self._cache[table][2]
         if ws.row_count < len(values):
             ws.add_rows(len(values) - ws.row_count + 50)
         # Write first, then clear leftovers, so a failed call never leaves the tab empty.

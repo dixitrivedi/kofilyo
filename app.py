@@ -22,10 +22,6 @@ apply_theme()
 
 CHART = an.CHART_CONFIG
 NEW_ITEM = "+ New item…"
-DEFAULT_ITEMS = ["Milk", "Tea leaves", "Coffee powder", "Sugar", "Ice", "Paper cups", "Lids and straws",
-                 "Chocolate syrup", "Mangoes", "Lemons", "Ginger", "LPG cylinder"]
-
-
 # ------------------------------------------------------------------ helpers
 def flash() -> None:
     msg = st.session_state.pop("flash", None)
@@ -75,6 +71,40 @@ def name_picker(label: str, options: list[str], key: str, placeholder: str, new_
         st.caption("It will be in the list next time.")
         return typed or None
     return choice
+
+
+def _remove_choice(kind: str, name: str) -> None:
+    db.remove_choice(kind, name)
+    st.session_state["flash"] = f"Removed {name} from the list"
+
+
+def list_editor(kind: str, noun: str, used_for: str) -> None:
+    """An “Edit the list” section: every name with a remove button, and a box to add a new one."""
+    import hashlib
+    with st.expander("Edit the list", icon=":material/edit_note:"):
+        names = db.get_choices(kind)
+        if not names:
+            md(f'<p class="muted">The list is empty. Add a {noun} below.</p>')
+        for n in names:
+            slug = hashlib.md5(n.lower().encode()).hexdigest()[:10]
+            with st.container(key=f"chrow-{kind}{slug}"):
+                c = st.columns([5, 0.7], vertical_alignment="center", gap="small")
+                c[0].markdown(f'<div class="drink" style="font-size:16px">{esc(n)}</div>', unsafe_allow_html=True)
+                c[1].button(":material/delete:", key=f"del-ch{kind}{slug}", help=f"Remove {n} from the list",
+                            on_click=_remove_choice, args=(kind, n))
+        v = st.session_state.get(f"ch-v-{kind}", 0)
+        c = st.columns([3, 1.2], vertical_alignment="bottom", gap="small")
+        new = c[0].text_input(f"Add a {noun}", key=f"ch-new-{kind}-{v}")
+        if c[1].button("Add", key=f"ch-add-{kind}", width="stretch", icon=":material/add:"):
+            try:
+                added = db.add_choice(kind, new)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state[f"ch-v-{kind}"] = v + 1
+                st.session_state["flash"] = f"Added {added} to the list"
+                st.rerun()
+        st.caption(f"Removing a name only takes it off this list. {used_for} already saved keep their name.")
 
 
 def pay_status(revenue: float, paid: float) -> str:
@@ -167,38 +197,213 @@ def _step(key: str, delta: int) -> None:
     st.session_state[key] = max(0, int(st.session_state.get(key, 0)) + delta)
 
 
-def _rest_is_cash(keys: dict[str, str], revenue: float) -> None:
+def _rest_is_cash(keys: dict[str, str], total: float) -> None:
     other = float(st.session_state[keys["upi"]]) + float(st.session_state[keys["card"]])
-    st.session_state[keys["cash"]] = float(max(0.0, round(revenue - other, 2)))
+    st.session_state[keys["cash"]] = float(max(0.0, round(total - other, 2)))
+
+
+def _start_over(tag: str) -> None:
+    """Clear the correction counters for a day, so the next screen starts from what is saved."""
+    _forget(f"fix-{tag}-")
+
+
+METHOD_COLOR = {"Cash": "good", "UPI": "cold", "Card": "accent"}
 
 
 def page_sales() -> None:
     flash()
-    t_ = T()
     head, pick = st.columns([1.6, 1], vertical_alignment="bottom")
     with pick:
         d = date_picker("sales")
+        tag = d.isoformat()
+        fix = st.toggle("Correct the day’s totals", key="sales-fix", on_change=_start_over, args=(tag,),
+                        help="Change what is already saved for the day, instead of taking a new order")
+    whose = f"{day_phrase(d)}’s" if day_phrase(d) in ("today", "yesterday") else f"{d:%a %d %b}’s"
     with head:
-        page_title(f"What sold {day_phrase(d)}?",
-                   "Tap + for every cup, or type the count. Nothing is saved until you press Save sales.")
+        if fix:
+            page_title(f"Correct {whose} totals",
+                       "These are the saved totals for the whole day. Change them and press Save totals. "
+                       "The order list is not changed.")
+        else:
+            page_title("New order", "Pick each drink the customer asks for, choose how they paid, then press "
+                                    "Save order.")
     st.write("")
-
     products = db.get_products(include_deleted=True)
+    if products.empty:
+        empty("No drinks on the menu", "Add your drinks in <b>Menu and prices</b>, then come back here.")
+        return
+    if fix:
+        _correct_totals(d, tag, products)
+    else:
+        _take_order(d, tag, whose, products)
+
+
+# ------------------------------------------------------------- new order
+def _order(tag: str) -> list[dict]:
+    return st.session_state.setdefault(f"order-{tag}", [])
+
+
+def _add_to_order(tag: str) -> None:
+    pid = st.session_state.get(f"pick-{tag}")
+    qty = int(st.session_state.get(f"pickqty-{tag}") or 1)
+    if pid is None:
+        st.session_state["order-msg"] = "Choose a drink first."
+        return
+    lines = _order(tag)
+    for line in lines:
+        if line["pid"] == pid:
+            line["qty"] += qty
+            break
+    else:
+        lines.append({"pid": pid, "qty": qty})
+    st.session_state[f"pick-{tag}"] = None       # ready for the next drink
+    st.session_state[f"pickqty-{tag}"] = 1
+
+
+def _change_line(tag: str, pid: int, delta: int) -> None:
+    lines = _order(tag)
+    for line in lines:
+        if line["pid"] == pid:
+            line["qty"] += delta
+    st.session_state[f"order-{tag}"] = [ln for ln in lines if ln["qty"] > 0]
+
+
+def _clear_order(tag: str) -> None:
+    st.session_state[f"order-{tag}"] = []
+    st.session_state[f"method-{tag}"] = None
+
+
+def _ask_remove_order(order_id: int) -> None:
+    st.session_state["confirm-order"] = order_id
+
+
+def _keep_order() -> None:
+    st.session_state.pop("confirm-order", None)
+
+
+def _remove_order(order_id: int) -> None:
+    db.delete_order(order_id)
+    st.session_state.pop("confirm-order", None)
+    st.session_state["flash"] = "Order removed, and taken off the day’s totals"
+
+
+def _take_order(d: date, tag: str, whose: str, products: pd.DataFrame) -> None:
+    t_ = T()
+    menu = products[products["active"] & ~products["deleted"]]
+    price = dict(zip(products["id"].astype(int), products["price"].astype(float)))
+    names = dict(zip(products["id"].astype(int), products["name"]))
+    if st.session_state.pop("order-reset", None) == tag:          # just saved: start a fresh order
+        st.session_state[f"order-{tag}"] = []
+        st.session_state[f"method-{tag}"] = None
+
+    for k, start in ((f"pick-{tag}", None), (f"pickqty-{tag}", 1), (f"method-{tag}", None)):
+        st.session_state.setdefault(k, start)      # set here only, so code can reset them later
+
+    left, right = st.columns([1.15, 1], gap="medium")
+    with left, st.container(key="panel-order"):
+        lines = _order(tag)
+        total = sum(ln["qty"] * price[ln["pid"]] for ln in lines)
+        cups = sum(ln["qty"] for ln in lines)
+        panel_head("This order", f'<span class="muted">{cups} {"cup" if cups == 1 else "cups"}</span>')
+        c = st.columns([3, 1, 1.5], vertical_alignment="bottom", gap="small")
+        c[0].selectbox("Drink", [int(i) for i in menu["id"]], key=f"pick-{tag}",
+                       format_func=lambda i: f"{names[i]}  ·  {money(price[i])}", placeholder="Choose a drink")
+        c[1].number_input("How many", min_value=1, step=1, key=f"pickqty-{tag}")
+        c[2].button("Add to order", on_click=_add_to_order, args=(tag,), icon=":material/add:", width="stretch",
+                    key=f"addline-{tag}")
+        msg = st.session_state.pop("order-msg", None)
+        if msg:
+            st.warning(msg, icon=":material/info:")
+        if not lines:
+            md('<p class="muted" style="margin:14px 0 4px">Choose a drink above and press Add to order. '
+               'Add each drink the customer asks for.</p>')
+        for ln in lines:
+            pid = ln["pid"]
+            with st.container(key=f"row-ol{pid}"):
+                c = st.columns([3.2, 0.8, 0.8, 0.8, 1.3, 0.5], vertical_alignment="center", gap="small")
+                c[0].markdown(f'<div class="drink">{esc(names[pid])}<small>{money(price[pid])} a cup</small></div>',
+                              unsafe_allow_html=True)
+                c[1].button("−", key=f"dec-o{pid}", on_click=_change_line, args=(tag, pid, -1), help="One less")
+                c[2].markdown(f'<div class="total-num" style="font-size:30px;text-align:center;color:inherit">'
+                              f'{ln["qty"]}</div>', unsafe_allow_html=True)
+                c[3].button("+", key=f"inc-o{pid}", on_click=_change_line, args=(tag, pid, 1), help="One more")
+                c[4].markdown(f'<div class="amount">{money(ln["qty"] * price[pid])}</div>', unsafe_allow_html=True)
+                c[5].button(":material/delete:", key=f"del-ol{pid}", help=f"Take {names[pid]} off the order",
+                            on_click=_change_line, args=(tag, pid, -ln["qty"]))
+        st.write("")
+        md(f'<div style="display:flex;justify-content:space-between;align-items:baseline;margin:6px 0 10px">'
+           f'<span class="muted">Order total</span><span class="total-num">{money(total)}</span></div>')
+        c = st.columns([1.5, 1], vertical_alignment="bottom", gap="small")
+        method = c[0].selectbox("Paid by", db.METHODS, key=f"method-{tag}",
+                                placeholder="Choose cash, UPI or card")
+        if c[1].button("Save order", type="primary", width="stretch", key=f"save-order-{tag}"):
+            try:
+                db.add_order(d, [(ln["pid"], ln["qty"], price[ln["pid"]]) for ln in lines], method or "")
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                st.session_state["order-reset"] = tag
+                st.session_state["flash"] = f"Saved: {cups} {'cup' if cups == 1 else 'cups'}, {money(total)} by {method}"
+                st.rerun()
+        if lines:
+            st.button("Clear this order", on_click=_clear_order, args=(tag,), key=f"clear-order-{tag}")
+
+    with right, st.container(key="panel-orders"):
+        orders = db.get_orders(d)
+        existing = db.get_sales_for_date(d)
+        day_total = float((existing["quantity"] * existing["unit_price"]).sum())
+        day_cups = int(existing["quantity"].sum())
+        pay = db.get_payment(d) or {"cash": 0.0, "upi": 0.0, "card": 0.0}
+        panel_head(f"{whose[0].upper() + whose[1:]} orders",
+                   f'<span class="muted">{money(day_total)}, {day_cups} {"cup" if day_cups == 1 else "cups"}</span>')
+        if any(pay.values()):
+            md('<div class="paylist" style="margin:0 0 12px">' + "".join(
+                f'<div><i style="background:{t_[METHOD_COLOR[m]]}"></i>{m}<b>{money(pay[m.lower()])}</b></div>'
+                for m in db.METHODS) + "</div>")
+        gap = sum(pay.values()) - day_total
+        if abs(gap) > 0.5:     # e.g. a sale deleted by hand in the Google Sheet, but not its payment
+            st.warning(f"Payments recorded ({money(sum(pay.values()))}) don’t match the day’s sales "
+                       f"({money(day_total)}). To fix it, turn on Correct the day’s totals.", icon=":material/warning:")
+        if orders.empty:
+            md('<p class="muted">No orders saved for this day yet.</p>')
+        for r in orders.itertuples():
+            oid = int(r.id)
+            if st.session_state.get("confirm-order") == oid:
+                with st.container(key=f"row-confirm-o{oid}"):
+                    c = st.columns([3, 1.1, 1.1], vertical_alignment="center", gap="small")
+                    c[0].markdown(f'<div class="drink">Remove this order?<small>{esc(r.items)}, {money(r.total)}'
+                                  '</small></div>', unsafe_allow_html=True)
+                    c[1].button("Keep", key=f"keep-o{oid}", on_click=_keep_order, width="stretch")
+                    c[2].button("Remove", key=f"confirmdel-o{oid}", type="primary", on_click=_remove_order,
+                                args=(oid,), width="stretch")
+                continue
+            with st.container(key=f"row-ord{oid}"):
+                c = st.columns([0.8, 3, 1.3, 0.5], vertical_alignment="center", gap="small")
+                c[0].markdown(f'<div class="muted">{esc(r.order_time) or "–"}</div>', unsafe_allow_html=True)
+                c[1].markdown(f'<div class="drink" style="font-size:16px">{esc(r.items)}<small>'
+                              f'<span style="color:{t_[METHOD_COLOR.get(r.method, "faint")]}">●</span> '
+                              f'{esc(r.method)}</small></div>', unsafe_allow_html=True)
+                c[2].markdown(f'<div class="amount" style="color:inherit">{money(r.total)}</div>',
+                              unsafe_allow_html=True)
+                c[3].button(":material/delete:", key=f"del-o{oid}", help="Remove this order",
+                            on_click=_ask_remove_order, args=(oid,))
+
+
+# ------------------------------------------------------- correct totals
+def _correct_totals(d: date, tag: str, products: pd.DataFrame) -> None:
+    t_ = T()
     existing = db.get_sales_for_date(d)
     ex_qty = {int(k): int(v) for k, v in zip(existing["product_id"], existing["quantity"])}
     ex_price = {int(k): float(v) for k, v in zip(existing["product_id"], existing["unit_price"])}
     show = products[(products["active"] & ~products["deleted"]) | products["id"].isin(ex_qty.keys())]
-    if show.empty:
-        empty("No drinks on the menu", "Add your drinks in <b>Menu and prices</b>, then come back here.")
-        return
-
-    tag = d.isoformat()
-    qkey = {int(pid): f"qty-{tag}-{int(pid)}" for pid in show["id"]}
+    if st.session_state.pop("sales-reset", None) == tag:
+        _start_over(tag)
+    qkey = {int(pid): f"fix-{tag}-q{int(pid)}" for pid in show["id"]}
     for pid, k in qkey.items():
         if k not in st.session_state:
             st.session_state[k] = ex_qty.get(pid, 0)
     saved_pay = db.get_payment(d) or {"cash": 0.0, "upi": 0.0, "card": 0.0}
-    pkey = {m: f"pay-{tag}-{m}" for m in ("cash", "upi", "card")}
+    pkey = {m: f"fix-{tag}-pay-{m}" for m in ("cash", "upi", "card")}
     for m, k in pkey.items():
         if k not in st.session_state:
             st.session_state[k] = float(saved_pay[m])
@@ -220,47 +425,44 @@ def page_sales() -> None:
                     c = st.columns([3.2, 0.8, 1.15, 0.8, 1.3], vertical_alignment="center", gap="small")
                     c[0].markdown(f'<div class="drink">{esc(p.name)}<small>{money(price)} a cup</small></div>',
                                   unsafe_allow_html=True)
-                    c[1].button("−", key=f"dec-{pid}", on_click=_step, args=(qkey[pid], -1),
-                                help=f"One less {p.name}")
+                    c[1].button("−", key=f"dec-{pid}", on_click=_step, args=(qkey[pid], -1), help=f"One less {p.name}")
                     c[2].number_input(f"Cups of {p.name}", min_value=0, step=1, key=qkey[pid],
                                       label_visibility="collapsed")
-                    c[3].button("+", key=f"inc-{pid}", on_click=_step, args=(qkey[pid], 1),
-                                help=f"One more {p.name}")
+                    c[3].button("+", key=f"inc-{pid}", on_click=_step, args=(qkey[pid], 1), help=f"One more {p.name}")
                     c[4].markdown(f'<div class="amount">{money(qty * price)}</div>', unsafe_allow_html=True)
 
-    rows, total, revenue, changed = [], 0, 0.0, False
+    rows, cups, total = [], 0, 0.0
     for p in show.itertuples():
-        pid = int(p.id)
-        q = int(st.session_state[qkey[pid]])
-        price = ex_price.get(pid, float(p.price))
-        rows.append((pid, q, price))
-        total += q
-        revenue += q * price
-        changed |= q != ex_qty.get(pid, 0)
+        q = int(st.session_state[qkey[int(p.id)]])
+        pr = ex_price.get(int(p.id), float(p.price))
+        rows.append((int(p.id), q, pr))
+        cups += q
+        total += q * pr
     paid = {m: float(st.session_state[k]) for m, k in pkey.items()}
-    changed |= any(abs(paid[m] - saved_pay[m]) > 0.001 for m in paid)
 
     st.write("")
     with st.container(key="panel-pay"):
-        panel_head("How were you paid?", pay_status(revenue, sum(paid.values())))
+        panel_head("How were you paid for the whole day?", pay_status(total, sum(paid.values())))
         c = st.columns([1, 1, 1, 1], vertical_alignment="bottom", gap="small")
         c[0].number_input("Cash (₹)", min_value=0.0, step=10.0, format="%.0f", key=pkey["cash"])
         c[1].number_input("UPI (₹)", min_value=0.0, step=10.0, format="%.0f", key=pkey["upi"])
         c[2].number_input("Card (₹)", min_value=0.0, step=10.0, format="%.0f", key=pkey["card"])
-        c[3].button("Rest is cash", on_click=_rest_is_cash, args=(pkey, revenue), width="stretch",
-                    help="Sets cash to the day’s sales minus UPI and card")
+        c[3].button("Rest is cash", on_click=_rest_is_cash, args=(pkey, total), width="stretch",
+                    help="Sets cash to the total minus UPI and card")
 
     st.write("")
     with st.container(key="savebar"):
         a, b = st.columns([3, 1], vertical_alignment="center")
-        status = ('<span class="down">Not saved yet</span>' if changed
-                  else '<span class="faint">Saved</span>' if ex_qty else '<span class="faint">Nothing saved for this day</span>')
-        a.markdown(f'<span class="total-num">{money(revenue)}</span>&nbsp; <span class="muted">for the day</span>'
-                   f'&nbsp;&nbsp;&nbsp; <b>{total:,}</b> cups&nbsp;&nbsp;&nbsp; {status}', unsafe_allow_html=True)
-        if b.button("Save sales", type="primary", width="stretch"):
+        changed = any(q != ex_qty.get(pid, 0) for pid, q, _ in rows) or \
+            any(abs(paid[m] - saved_pay[m]) > 0.001 for m in paid)
+        status = '<span class="down">Not saved yet</span>' if changed else '<span class="faint">Saved</span>'
+        a.markdown(f'<span class="total-num">{money(total)}</span>&nbsp; <span class="muted">for the day</span>'
+                   f'&nbsp;&nbsp;&nbsp; <b>{cups:,}</b> cups&nbsp;&nbsp;&nbsp; {status}', unsafe_allow_html=True)
+        if b.button("Save totals", type="primary", width="stretch"):
             db.save_sales_for_date(d, rows)
             db.save_payment(d, paid["cash"], paid["upi"], paid["card"])
-            st.session_state["flash"] = f"Saved sales for {d:%d %b}: {total:,} cups, {money(revenue)}"
+            st.session_state["sales-reset"] = tag
+            st.session_state["flash"] = f"Saved the totals for {d:%d %b}: {cups:,} cups, {money(total)}"
             st.rerun()
 
 
@@ -287,7 +489,7 @@ def page_expenses() -> None:
     with left, st.container(key="panel-add"):
         panel_head("Add a purchase")
         v = st.session_state.get("exp_form_v", 0)
-        items = sorted(set(DEFAULT_ITEMS) | set(db.known_expense_items()), key=str.lower)
+        items = db.get_choices("items")
         choice = st.selectbox("Item", [NEW_ITEM] + items, index=None, key=f"exp-item-{v}",
                               placeholder="Choose what you bought")
         item = choice
@@ -308,9 +510,11 @@ def page_expenses() -> None:
                 st.error("Enter the amount you paid.")
             else:
                 db.add_expense(d, item, qty, unit, amount, notes)
+                db.add_choice("items", item)
                 st.session_state["exp_form_v"] = v + 1
                 st.session_state["flash"] = f"Added {item}: {money(amount, 2)}"
                 st.rerun()
+        list_editor("items", "item", "Purchases")
 
     with right, st.container(key="panel-list"):
         current = db.get_expenses_for_date(d)
@@ -406,7 +610,7 @@ def page_running() -> None:
     with left, st.container(key="panel-rcadd"):
         panel_head(f"Add a cost for {month:%B}")
         v = st.session_state.get("rc_form_v", 0)
-        name = name_picker("What for", db.known_running_cost_names(), f"rc-name-{v}", "Choose a cost",
+        name = name_picker("What for", db.get_choices("costs"), f"rc-name-{v}", "Choose a cost",
                            "Name of the cost")
         amount = st.number_input("Amount (₹)", min_value=0.0, step=100.0, format="%.0f", key=f"rc-amt-{v}")
         if f"rc-spread-{v}" not in st.session_state:
@@ -427,9 +631,11 @@ def page_running() -> None:
             except ValueError as exc:
                 st.error(str(exc))
             else:
+                db.add_choice("costs", name)
                 st.session_state["rc_form_v"] = v + 1
                 st.session_state["flash"] = f"Added {name}: {money(amount)}"
                 st.rerun()
+        list_editor("costs", "cost name", "Costs")
 
     with right, st.container(key="panel-rclist"):
         costs = db.get_running_costs(month)
@@ -564,8 +770,7 @@ def page_costing() -> None:
         panel_head("Recipe for one cup")
         pid = st.selectbox("Drink", list(names), format_func=names.get, key="cpc-drink")
         rows = _recipe_rows(pid)
-        items = sorted(set(DEFAULT_ITEMS) | set(db.known_expense_items()) |
-                       {r["item"] for r in rows if r["item"]}, key=str.lower)
+        items = sorted(set(db.get_choices("items")) | {r["item"] for r in rows if r["item"]}, key=str.lower)
         if rows:
             h = st.columns([2.4, 1.1, 1, 1.2, 0.5], gap="small")
             for col, label in zip(h, ["Ingredient", "Amount", "Unit", "Cost", ""]):
@@ -609,6 +814,9 @@ def page_costing() -> None:
                      st.session_state.get(f"ri-{pid}-{r['uid']}-unit") or "ml") for r in rows]
             try:
                 db.save_recipe(pid, data)
+                for item, _, _ in data:
+                    if item and item.strip():
+                        db.add_choice("items", item)
             except ValueError as exc:
                 st.error(str(exc))
             else:
@@ -995,5 +1203,8 @@ sidebar_brand()
 if "_theme_seg" not in st.session_state:
     st.session_state["_theme_seg"] = current_theme()
 theme_switch()
+if online:
+    st.sidebar.button("Refresh data", on_click=db.refresh, icon=":material/refresh:", key="refresh-data",
+                      help="Show changes made directly in the Google Sheet right away")
 auth.logout_button()
 nav.run()

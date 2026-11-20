@@ -104,6 +104,11 @@ hr {{ border-color: var(--line) !important; }}
 [data-baseweb="calendar"] div, [data-baseweb="calendar"] button {{ color: var(--text); }}
 [data-baseweb="calendar"] svg {{ fill: var(--text) !important; }}
 [data-testid="stForm"] {{ border: 0 !important; padding: 0 !important; }}
+.stApp [data-testid="stExpander"] details {{ background: var(--surface2) !important; border: 1px solid var(--line2) !important; border-radius: 14px !important; }}
+.stApp [data-testid="stExpander"] summary {{ background: var(--surface2) !important; border-radius: 14px; }}
+.stApp [data-testid="stExpander"] summary, .stApp [data-testid="stExpander"] summary p,
+.stApp [data-testid="stExpander"] summary [data-testid="stIconMaterial"] {{ color: var(--text) !important; }}
+.stApp [data-testid="stExpander"] summary:hover p {{ color: var(--accent-text) !important; }}
 .stApp [data-baseweb="input"] button, .stApp [data-baseweb="base-input"] button {{ color: var(--muted) !important; background: transparent !important; }}
 .stApp [data-baseweb="input"] button svg {{ fill: var(--muted) !important; color: var(--muted) !important; }}
 
@@ -138,6 +143,9 @@ hr {{ border-color: var(--line) !important; }}
 [class*="st-key-qty-"] [data-baseweb="input"] {{ background: var(--bg) !important; border: 0 !important; }}
 [class*="st-key-qty-"] input {{ text-align: center; font-family: 'Big Shoulders Display', sans-serif !important; font-size: 26px !important; font-weight: 600; padding: 4px 0 !important; }}
 [class*="st-key-row-"] {{ border-top: 1px solid var(--line); padding-top: 10px; }}
+[class*="st-key-chrow-"] {{ border-top: 1px solid var(--line); padding-top: 4px; gap: 0 !important; }}
+[class*="st-key-chrow-"] [data-testid="stHorizontalBlock"] {{ flex-wrap: nowrap !important; }}
+[class*="st-key-chrow-"] [data-testid="stColumn"] {{ min-width: 0 !important; }}
 [class*="st-key-row-confirm"] {{ background: var(--surface2); border: 1px solid var(--bad); border-radius: 16px; padding: 10px 14px; }}
 .stApp [class*="st-key-confirmdel-"] button, .stApp [class*="st-key-confirmdel-"] button:hover {{
   background: var(--bad) !important; color: #FFFFFF !important; }}

@@ -34,7 +34,7 @@ cell A1. Delete old backup tabs whenever you no longer need them.
 
 Streamlit Cloud wipes its disk on every restart, so online the app keeps its data in a Google Sheet
 with three tabs: `products`, `sales` and `expenses`. You can open the sheet any time to look at the
-numbers. Avoid editing it by hand while the app is in use; the app re-reads the sheet every 5 minutes.
+numbers. You can fix or delete rows by hand: the app shows the change within 15 seconds, or at once if you press **Refresh data** in the sidebar. Every save re-reads the sheet first, so a row you deleted is never written back.
 
 **1. Make a Google "service account" (a robot login the app uses)**
 1. Go to <https://console.cloud.google.com>, sign in, and create a project (for example `Kofilyo`).

@@ -39,14 +39,32 @@ _STORE = None
 _LOCK = threading.RLock()
 
 
+_DEPTH = threading.local()
+
+
 def _locked(fn):
     """Run a change while holding the lock, so changes from two sessions never interleave
-    (each reads, changes and writes a whole table)."""
+    (each reads, changes and writes a whole table). The outermost change starts by re-reading the
+    data, so rows edited or deleted by hand in the sheet are never written back."""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         with _LOCK:
-            return fn(*args, **kwargs)
+            depth = getattr(_DEPTH, "n", 0)
+            if depth == 0:
+                refresh()
+            _DEPTH.n = depth + 1
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _DEPTH.n = depth
     return wrapper
+
+
+def refresh() -> None:
+    """Forget the remembered copy of the data, so the next read fetches the latest."""
+    s = _STORE
+    if s is not None and hasattr(s, "refresh"):
+        s.refresh()
 
 
 def _sheet_settings():
@@ -121,14 +139,21 @@ def _append(table: str, df: pd.DataFrame, rows: list[dict]) -> pd.DataFrame:
     return pd.concat([df, coerce(table, new)], ignore_index=True)
 
 
-@_locked
 def init_db() -> None:
+    """Runs on every page load, so it only reads (from the remembered copy). It changes something only
+    for a brand-new data store: then it adds the starter menu."""
+    for table in ("products", "sales", "expenses", "running_costs", "payments", "recipes", "choices", "orders"):
+        _read(table)    # creates the tabs in a new Google Sheet
     if _read("products").empty:
+        _starter_menu()
+
+
+@_locked
+def _starter_menu() -> None:
+    if _read("products").empty:      # check again with fresh data: another session may have done it
         _write("products", _append("products", empty("products"), [
             {"name": n, "category": c, "price": p, "active": 1, "deleted": 0} for n, c, p in DEFAULT_PRODUCTS
         ]))
-    for table in ("sales", "expenses", "running_costs", "payments", "recipes"):
-        _read(table)    # creates the tabs in a new Google Sheet
 
 
 # ---------------------------------------------------------------- products
@@ -212,6 +237,28 @@ def get_sales_for_date(d: date) -> pd.DataFrame:
 
 
 @_locked
+@_locked
+def add_sales_for_date(d: date, rows: list[tuple[int, int, float]]) -> None:
+    """Add a new sale's (product_id, quantity, unit_price) rows on top of what the day already has.
+    Each drink keeps one row per day; if the price differs, the row's price becomes the average so the
+    day's money stays exact."""
+    s = _read("sales")
+    iso, new = d.isoformat(), []
+    for pid, q, price in rows:
+        if not q or q <= 0:
+            continue
+        match = s.index[(s["sale_date"] == iso) & (s["product_id"] == int(pid))]
+        if len(match):
+            i = match[0]
+            old_q, old_p = int(s.at[i, "quantity"]), float(s.at[i, "unit_price"])
+            total_q = old_q + int(q)
+            s.at[i, "unit_price"] = round((old_q * old_p + int(q) * float(price)) / total_q, 4)
+            s.at[i, "quantity"] = total_q
+        else:
+            new.append({"sale_date": iso, "product_id": int(pid), "quantity": int(q), "unit_price": float(price)})
+    _write("sales", _append("sales", s, new).sort_values(["sale_date", "id"]))
+
+
 def save_sales_for_date(d: date, rows: list[tuple[int, int, float]]) -> None:
     """Replace all sales for a date with (product_id, quantity, unit_price) rows."""
     s = _read("sales")
@@ -280,8 +327,7 @@ def delete_expense(expense_id: int) -> None:
 
 
 def known_expense_items() -> list[str]:
-    items = _read("expenses")["item"]
-    return sorted({i for i in items if i}, key=str.lower)
+    return get_choices("items")
 
 
 def load_expenses() -> pd.DataFrame:
@@ -294,6 +340,83 @@ def load_expenses() -> pd.DataFrame:
         "amount": e["amount"],
         "notes": e["notes"],
     })
+
+
+# ------------------------------------------------------------------ orders
+METHODS = ["Cash", "UPI", "Card"]
+
+
+def _encode_lines(lines: list[tuple[int, int, float]]) -> str:
+    return "|".join(f"{int(p)}*{int(q)}*{float(pr):g}" for p, q, pr in lines)
+
+
+def _decode_lines(text: str) -> list[tuple[int, int, float]]:
+    out = []
+    for part in (text or "").split("|"):
+        try:
+            p, q, pr = part.split("*")
+            out.append((int(p), int(q), float(pr)))
+        except ValueError:
+            continue
+    return out
+
+
+@_locked
+def add_order(d: date, lines: list[tuple[int, int, float]], method: str) -> dict:
+    """Record one customer's order: adds the drinks to the day's sales and the money to the chosen
+    payment type, and keeps the order so it can be listed (and undone). Returns the saved order."""
+    lines = [(int(p), int(q), float(pr)) for p, q, pr in lines if q and q > 0]
+    if not lines:
+        raise ValueError("Add at least one drink to the order.")
+    if method not in METHODS:
+        raise ValueError("Choose how the customer paid.")
+    menu = get_products(include_deleted=True)
+    names = dict(zip(menu["id"], menu["name"]))
+    total = round(sum(q * pr for _, q, pr in lines), 2)
+    add_sales_for_date(d, lines)
+    add_payment(d, total if method == "Cash" else 0.0, total if method == "UPI" else 0.0,
+                total if method == "Card" else 0.0)
+    row = {"order_date": d.isoformat(), "order_time": clock.now().strftime("%H:%M") if d == clock.today() else "",
+           "items": ", ".join(f"{names.get(p, '?')} × {q}" for p, q, _ in lines), "method": method,
+           "total": total, "lines": _encode_lines(lines)}
+    _write("orders", _append("orders", _read("orders"), [row]))
+    return row
+
+
+def get_orders(d: date) -> pd.DataFrame:
+    o = _read("orders")
+    return o[o["order_date"] == d.isoformat()].sort_values("id", ascending=False).reset_index(drop=True)
+
+
+@_locked
+def delete_order(order_id: int) -> None:
+    """Undo an order: take its drinks out of the day's sales and its money out of the payment type."""
+    o = _read("orders")
+    row = o[o["id"] == int(order_id)]
+    if row.empty:
+        return
+    r = row.iloc[0]
+    d = date.fromisoformat(r.order_date)
+    s = _read("sales")
+    for pid, q, price in _decode_lines(r.lines):
+        idx = s.index[(s["sale_date"] == r.order_date) & (s["product_id"] == pid)]
+        if not len(idx):
+            continue
+        i = idx[0]
+        left_q = int(s.at[i, "quantity"]) - q
+        left_money = int(s.at[i, "quantity"]) * float(s.at[i, "unit_price"]) - q * price
+        if left_q <= 0:
+            s = s.drop(index=i)
+        else:
+            s.at[i, "quantity"] = left_q
+            s.at[i, "unit_price"] = round(max(left_money, 0.0) / left_q, 4)
+    _write("sales", s.sort_values(["sale_date", "id"]))
+    pay = get_payment(d) or {"cash": 0.0, "upi": 0.0, "card": 0.0}
+    key = {"Cash": "cash", "UPI": "upi", "Card": "card"}.get(r.method)
+    if key:
+        pay[key] = max(0.0, pay[key] - float(r.total))
+        save_payment(d, pay["cash"], pay["upi"], pay["card"])
+    _write("orders", o[o["id"] != int(order_id)])
 
 
 # ----------------------------------------------------------- running costs
@@ -361,8 +484,60 @@ def copy_monthly_costs(from_month: date, to_month: date) -> int:
 
 
 def known_running_cost_names() -> list[str]:
-    names = set(RUNNING_COST_NAMES) | {n for n in _read("running_costs")["name"] if n}
-    return sorted(names, key=str.lower)
+    return get_choices("costs")
+
+
+# ------------------------------------------------------------ drop-down lists
+PURCHASE_ITEMS = ["Milk", "Tea leaves", "Coffee powder", "Sugar", "Ice", "Paper cups", "Lids and straws",
+                  "Chocolate syrup", "Mangoes", "Lemons", "Ginger", "LPG cylinder"]
+LIST_DEFAULTS = {"costs": RUNNING_COST_NAMES, "items": PURCHASE_ITEMS}
+SEEDED = "_seeded"   # marker row: this list has been filled once, so removing every name keeps it empty
+
+
+def _history(kind: str) -> set[str]:
+    table, col = ("running_costs", "name") if kind == "costs" else ("expenses", "item")
+    return {n for n in _read(table)[col] if n}
+
+
+@_locked
+def _seed(kind: str) -> None:
+    c = _read("choices")
+    if ((c["list"] == SEEDED) & (c["name"] == kind)).any():
+        return
+    names = sorted(set(LIST_DEFAULTS[kind]) | _history(kind), key=str.lower)
+    rows = [{"list": kind, "name": n} for n in names] + [{"list": SEEDED, "name": kind}]
+    _write("choices", _append("choices", c, rows))
+
+
+def get_choices(kind: str) -> list[str]:
+    """The names offered in a drop-down list, A to Z. Filled the first time from the usual names
+    plus everything already used; after that it is exactly what you add and remove."""
+    c = _read("choices")
+    if not ((c["list"] == SEEDED) & (c["name"] == kind)).any():
+        _seed(kind)
+        c = _read("choices")
+    return sorted(c.loc[c["list"] == kind, "name"].tolist(), key=str.lower)
+
+
+@_locked
+def add_choice(kind: str, name: str) -> str:
+    """Add a name to a list (ignored if it is already there, in any capitals). Returns the clean name."""
+    name = " ".join(name.split())
+    if not name:
+        raise ValueError("Type a name to add.")
+    get_choices(kind)                      # make sure the list exists before adding to it
+    c = _read("choices")
+    if (c.loc[c["list"] == kind, "name"].str.lower() == name.lower()).any():
+        return name
+    _write("choices", _append("choices", c, [{"list": kind, "name": name}]))
+    return name
+
+
+@_locked
+def remove_choice(kind: str, name: str) -> None:
+    """Take a name off a list. Records that already use it are not touched."""
+    c = _read("choices")
+    _write("choices", c[~((c["list"] == kind) & (c["name"].str.lower() == name.lower()))])
 
 
 def load_running_costs() -> pd.DataFrame:
@@ -382,6 +557,15 @@ def get_payment(d: date) -> dict | None:
 
 
 @_locked
+@_locked
+def add_payment(d: date, cash: float, upi: float, card: float) -> None:
+    """Add one sale's payment amounts to the day's totals."""
+    if not (cash or upi or card):
+        return
+    now = get_payment(d) or {"cash": 0.0, "upi": 0.0, "card": 0.0}
+    save_payment(d, now["cash"] + cash, now["upi"] + upi, now["card"] + card)
+
+
 def save_payment(d: date, cash: float, upi: float, card: float) -> None:
     """One row per day. All zeros removes the day's row."""
     p = _read("payments")
@@ -484,7 +668,7 @@ def cost_per_cup() -> pd.DataFrame:
 
 
 # ------------------------------------------------------------------- admin
-WIPED = ("sales", "expenses", "running_costs", "payments")   # Start fresh clears these; menu and recipes stay
+WIPED = ("sales", "expenses", "running_costs", "payments", "orders")   # Start fresh clears these; menu and recipes stay
 
 
 @_locked
